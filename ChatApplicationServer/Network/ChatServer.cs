@@ -1,104 +1,182 @@
-﻿using System;//Khai báo thư viện cơ bản
-using System.Collections.Concurrent;//Dùng ConcurrentDictionary đồng bộ hóa ngầm,nhiều luồng hoạt động không sợ xung đột
+﻿using ChatApplicationServer.Network;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.IO;//ĐỌc ghi dl
 using System.Linq;
 using System.Net;
-using System.Net.Sockets;//LTM để tạo server TCP IP ...
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;//Hỗ trợ đa luồng 
+using System.Threading.Tasks;
 
 namespace ChatApplicationServer
 {
-    internal class ChatServer
+    internal class Program
     {
-        static readonly ConcurrentDictionary<int, ClientHandle> _clients = new();//Dùng ConcurrentDictionary để lưu trữ các client đang kết nối, đảm bảo thread-safe khi truy cập từ nhiều luồng
+        static readonly ConcurrentDictionary<int, ClientHandle> _clients = new();
         static int _nextId = 0;
+        static Database _db = null!;
         static async Task Main()
         {
-            Console.OutputEncoding = Encoding.UTF8; // Đọc tiếng Việt có dấu
-            var listener = new TcpListener(IPAddress.Any, 9000);//Tạo server lắng nghe all IPAddress tại cổng 9000
-            listener.Start();//Bắt đầu mở cho client kết nối
+            Console.OutputEncoding = Encoding.UTF8;
+
+            string cs = Environment.GetEnvironmentVariable("CHAT_DB") ?? @"Server=.;Database=ChatApplicationDB;Trusted_Connection=True;TrustServerCertificate=True;";
+            _db = new Database(cs);
+
+            var listener = new TcpListener(IPAddress.Any, 9000);
+            listener.Start();
             Console.WriteLine("Server: Đang lắng nghe tại cổng 9000...");
-            while (true)//vòng lặp vh
+            while (true)
             {
-                TcpClient tcp = await listener.AcceptTcpClientAsync();//CHờ và nhận kết nối
-                int id = Interlocked.Increment(ref _nextId);//Tạo ID ( tăng dần )
+                TcpClient tcp = await listener.AcceptTcpClientAsync();
+                int id = Interlocked.Increment(ref _nextId);
 
-                var handle = new ClientHandle(id, tcp);//Tạo đối tượng Cleint -> quản lý kết nối của client
-                _clients[id] = handle;//Thêm client vào danh sách đang kết nối
-                Console.WriteLine($"Server: Client #{id} đã kết nối ({_clients.Count} người online");
+                var c = new ClientHandle(id, tcp);
+                _clients[id] = c;
+                Console.WriteLine($"Server: Client #{id} đã kết nối ({_clients.Count}) người online");
 
-                _ = HandleClientAsync(handle);//Phân Luồng xử lý cleint( nhiều người kết nối cùng lúc )
+                _ = HandleClientAsync(c);
             }
         }
-        static async Task HandleClientAsync(ClientHandle c) //Xử lý giao tiếp với client
+        static async Task HandleClientAsync(ClientHandle c)
         {
-            await BroadcastAsync($"Client #{c.Id} đã tham gia vào phòng chat.", exceptId: c.Id);
-
             try
             {
                 string? line;
 
-                while ((line = await c.Reader.ReadLineAsync()) != null)//Đợi và đọc từng dòng tin nhắn từ client, nếu client ngắt kết nối sẽ trả về null
-                {
-                    Console.WriteLine($"Client #{c.Id} {line}");//In ra Sv
-                    await BroadcastAsync($"Client: {c.Id}: {line}", exceptId: c.Id);//Sv phát cho các cleint khác(trừ client gửi)
-                }
+                while ((line = await c.Reader.ReadLineAsync()) != null) await ProcessCommandAsync(c, line);
             }
             catch (IOException) { }
             finally
             {
-                _clients.TryRemove(c.Id, out _);//Xóa client khỏi danh sách khi ngắt kết nối
-                c.Dispose();//Giải phóng tài nguyên
-                Console.WriteLine($"Client #{c.Id} đã rời ({_clients.Count} người online.");//Thông báo
-                await BroadcastAsync($"Client #{c.Id} đã rời khỏi phòng.", exceptId: c.Id);//Báo cho người khác
+                _clients.TryRemove(c.Id, out _);
+                if (c.Room != null) await BroadcastToRoomAsync(c.Room, $"{c.Account} đã rời khỏi phòng.", exceptId: c.Id);
+                c.Dispose();
+                Console.WriteLine($"Client #{c.Id} đã rời ({_clients.Count} người online).");
             }
-        }
-        static async Task BroadcastAsync(string msg, int exceptId)//Hàm phát tin nhắn đến tất cả client ngoại trừ client có ID exceptId
-        {
-            foreach (var c in _clients.Values)//Duyệt all client đang onl
-            {
-                if (c.Id == exceptId) continue;//nếu là client gửi thì bỏ qua
-                await c.SendAsync(msg);//Gửi tin đến client đó
-            }
-        }
-    }
-    class ClientHandle : IDisposable//Lớp quản lý kết nối của client, bao gồm ID, luồng đọc và ghi, và phương thức gửi tin nhắn
-    {
-        public int Id { get; }
-        public StreamReader Reader { get; }//Dùng để đọc tin nhắn từ client
-
-        private readonly TcpClient _tcp;//Lưu kết nối mạng
-        private readonly StreamWriter _writer;//Dùng để gửi tin nhắn đến client
-        private readonly SemaphoreSlim _writerLock = new(1, 1);//Khóa dữ liệu(đồng bộ hóa)
-
-        public ClientHandle(int id, TcpClient tcp)//Tạo đối tượng quản lý client
-        {
-            Id = id;
-            _tcp = tcp;
-            var stream = tcp.GetStream();
-            Reader = new StreamReader(stream);
-            _writer = new StreamWriter(stream)
-            {
-                AutoFlush = true
-            };
         }
 
-        public async Task SendAsync(string msg)//Gửi tin nhắn tới client
+        static async Task ProcessCommandAsync(ClientHandle c, string line)
         {
-            await _writerLock.WaitAsync();//Đảm bảo 1 lần chỉ có 1 luồng được phép ghi dữ liệu
-            try
+            int sep = line.IndexOf('|');
+            string command = (sep < 0 ? line : line[..sep]).ToUpperInvariant();
+            string rest = sep < 0 ? "" : line[(sep + 1)..];
+
+            if (command is "REGISTER" or "LOGIN")
             {
-                await _writer.WriteLineAsync(msg);
+                await HandleAuthAsync(c, command, rest);
+                return;
             }
-            catch { }
-            finally
+
+            if (!c.Authenticated)
             {
-                _writerLock.Release();//Giải phóng khóa sau khi gửi xong, cho phép luồng khác có thể gửi tin nhắn tiếp theo
+                await c.SendAsync("ERROR| Bạn cần phải đăng nhập trước");
+                return;
+            }
+
+            switch (command)
+            {
+                case "ACCOUNT":
+                    c.Account = string.IsNullOrWhiteSpace(rest) ? c.Account : rest.Trim();
+                    await c.SendAsync($"Tên của bạn: {c.Account}");
+                    break;
+                case "JOIN":
+                    await JoinRoomAsync(c, rest.Trim());
+                    break;
+                case "LEAVE":
+                    await LeaveRoomAsync(c);
+                    break;
+                case "ROOMS":
+                    await SendRoomListAsync(c);
+                    break;
+                case "MESSAGE":
+                    if (c.Room is null) await c.SendAsync("Bạn chưa tham gia phòng chat nào. Sử dụng /join <tên phòng>.");
+                    else await BroadcastToRoomAsync(c.Room, $"{c.Room} {c.Account}: {rest}", exceptId: c.Id);
+                    break;
+                default:
+                    await c.SendAsync("Lệnh không hợp lệ");
+                    break;
             }
         }
-        public void Dispose() => _tcp.Dispose();//Đóng kết nối mạng khi kh sử dụng, giải phóng tn
+
+        static async Task HandleAuthAsync(ClientHandle c, string command, string rest)
+        {
+            var a = rest.Split('|', 2);
+            string user = a.Length > 0 ? a[0] : "";
+            string pass = a.Length > 1 ? a[1] : "";
+
+            if (user.Length == 0 || pass.Length == 0)
+            {
+                await c.SendAsync("ERROR| Thiếu tên đăng nhập hoặc mật khẩu.");
+                return;
+            }
+
+            if (command == "REGISTER")
+            {
+                if (_db.Register(user, pass, out string err))
+                    await c.SendAsync("OK| Đăng ký thành công! Hãy đăng nhập.");
+                else
+                    await c.SendAsync($"ERROR| {err}");
+            }
+            else
+            {
+                if (_db.Login(user, pass))
+                {
+                    c.Authenticated = true;
+                    c.Account = user;
+                    await c.SendAsync($"OK| Xin chào {user}, bạn đã đăng nhập thành công");
+                    Console.WriteLine($"SERVER| {user} đăng nhập (client #{c.Id}).");
+                }
+                else await c.SendAsync("ERROR| Sai tên đăng nhập hoặc mật khẩu.");
+            }
+        }
+
+        static async Task JoinRoomAsync(ClientHandle c, string room)
+        {
+            if (string.IsNullOrWhiteSpace(room))
+            {
+                await c.SendAsync("Tên phòng trống");
+                return;
+            }
+            if (c.Room != null) await LeaveRoomAsync(c);
+            c.Room = room;
+            await c.SendAsync($"Đã vào phòng {room}");
+
+            var history = _db.GetRecentMessages(room);
+            if (history.Count > 0)
+            {
+                await c.SendAsync("==== Lịch sử gần đây ====");
+                foreach (var h in history) await c.SendAsync(h);
+                await c.SendAsync("=========================");
+            }
+
+            await BroadcastToRoomAsync(room, $"{c.Account} đã tham gia phòng chat", exceptId: c.Id);
+        }
+
+        static async Task LeaveRoomAsync(ClientHandle c)
+        {
+            if (c.Room is null) return;
+            string oldRoom = c.Room;
+            c.Room = null;
+            await BroadcastToRoomAsync(oldRoom, $"{c.Account} đã rời khỏi phòng chat", exceptId: c.Id);
+            await c.SendAsync($"Đã rời khỏi phòng {oldRoom}");
+        }
+
+        static async Task SendRoomListAsync(ClientHandle c)
+        {
+            var groups = _clients.Values.Where(x => x.Room != null).GroupBy(x => x.Room)
+                .Select(g => $"{g.Key} ({g.Count()} người)").ToList();
+
+            string body = groups.Count > 0 ? string.Join("\n", groups) : " (chưa có phòng nào)";
+            await c.SendAsync($"Danh sách phòng: \n {body}");
+        }
+
+        static async Task BroadcastToRoomAsync(string room, string msg, int exceptId)
+        {
+            foreach (var c in _clients.Values)
+            {
+                if (c.Room == room && c.Id != exceptId) await c.SendAsync(msg);
+            }
+        }
     }
 }
