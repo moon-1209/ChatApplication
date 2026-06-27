@@ -2,16 +2,18 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;//ĐỌc ghi dl
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading.Tasks;
+using System.Threading;
+using System.Threading.Tasks;//Hỗ trợ đa luồng 
 
 namespace ChatApplicationServer
 {
-    internal class Program
+    internal class ChatServer
     {
         static readonly ConcurrentDictionary<int, ClientHandle> _clients = new();
         static int _nextId = 0;
@@ -120,5 +122,6 @@ namespace ChatApplicationServer
                 if (c.Room == room && c.Id != exceptId) await c.SendAsync(msg);
             }
         }
+        public void Dispose() => _tcp.Dispose();//Đóng kết nối mạng khi kh sử dụng, giải phóng tn
     }
 }
