@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -8,6 +10,7 @@ namespace ChatApplicationClient
 {
     internal class ChatClient
     {
+<<<<<<< HEAD
         static async Task Main(string[] args) //bắt đầu chương trình
         {
             Console.OutputEncoding = Encoding.UTF8; //đọc tiếng việt
@@ -25,10 +28,28 @@ namespace ChatApplicationClient
             Console.WriteLine("\nĐăng nhập thành công! Gõ /help để xem lệnh\n");
             PrintHelp(); //In lệnh hỗ trợ
             _ = Task.Run(async () => //Tạo một luồng mới để đọc dữ liệu từ server, nếu mất kết nối thì thoát chương trình
+=======
+        static async Task Main(string[] args)
+        {
+            Console.OutputEncoding = Encoding.UTF8;
+            Console.Write("Nhập IP Server: ");
+            string host = Console.ReadLine() is { Length: > 0 } h ? h : "127.0.0.1";
+
+            using var client = new TcpClient();
+            await client.ConnectAsync(host, 9000);
+            Console.WriteLine("Đã kết nối. Gõ tin nhắn rồi Enter để gửi. Nhập /exit để thoát.");
+
+            var stream = client.GetStream();
+            var reader = new StreamReader(stream);
+            var writer = new StreamWriter(stream) { AutoFlush = true };
+
+            _ = Task.Run(async () =>
+>>>>>>> ad68fbfa3ee913988180e196468496936293216a
             {
                 try
                 {
                     string? line;
+<<<<<<< HEAD
                     while ((line = await reader.ReadLineAsync()) != null) Console.WriteLine(line); //Liên tục đọc từng dòng từ server và in ra màn hình
                 }
                 catch { } //Bỏ qua lỗi khi kết nối bị đóng đột ngột
@@ -55,6 +76,19 @@ namespace ChatApplicationClient
                     }
                 }
                 else await writer.WriteLineAsync($"MESSAGE|{input}"); //Không / thì hiển thị tin nhắn bình thường
+=======
+                    while ((line = await reader.ReadLineAsync()) != null) Console.WriteLine(line);
+                }
+                catch { }
+                Console.WriteLine("Mất kết nối tới Server");
+                Environment.Exit(0);
+            });
+            string? input;
+            while((input = Console.ReadLine()) != null)
+            {
+                if (input.Equals("/exit", StringComparison.OrdinalIgnoreCase)) break;
+                await writer.WriteLineAsync(input);
+>>>>>>> ad68fbfa3ee913988180e196468496936293216a
             }
         }
 
