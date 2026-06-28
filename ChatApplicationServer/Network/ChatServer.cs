@@ -1,21 +1,21 @@
-﻿using ChatApplicationServer.Network;
-using System;
+﻿using ChatApplicationServer.Data;
+using ChatApplicationServer.Security;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
 using System.Net;
-using System.Net.NetworkInformation;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Threading.Tasks;
 
-namespace ChatApplicationServer
+namespace ChatApplicationServer.Network
 {
     internal class Program
     {
-        static readonly ConcurrentDictionary<int, ClientHandle> _clients = new();
+        static readonly ConcurrentDictionary<int, ClientHandler> _clients = new();
         static int _nextId = 0;
         static Database _db = null!;
+        const string CertPass = "ChatCert123";
         static async Task Main()
         {
             Console.OutputEncoding = Encoding.UTF8;
@@ -23,28 +23,79 @@ namespace ChatApplicationServer
             string cs = Environment.GetEnvironmentVariable("CHAT_DB") ?? @"Server=.;Database=ChatApplicationDB;Trusted_Connection=True;TrustServerCertificate=True;";
             _db = new Database(cs);
 
+            var cert = CertificateHelper.Load("server.pfx", CertPass);
+
             var listener = new TcpListener(IPAddress.Any, 9000);
             listener.Start();
             Console.WriteLine("Server: Đang lắng nghe tại cổng 9000...");
+
             while (true)
             {
-                TcpClient tcp = await listener.AcceptTcpClientAsync();
-                int id = Interlocked.Increment(ref _nextId);
-
-                var c = new ClientHandle(id, tcp);
-                _clients[id] = c;
-                Console.WriteLine($"Server: Client #{id} đã kết nối ({_clients.Count}) người online");
-
-                _ = HandleClientAsync(c);
+                var tcp = await listener.AcceptTcpClientAsync();
+                _ = AcceptAsync(tcp, cert);
             }
         }
-        static async Task HandleClientAsync(ClientHandle c)
+
+        static async Task AcceptAsync(TcpClient tcp, X509Certificate2 cert)
+        {
+            ClientHandler? c = null;
+            try
+            {
+                var ssl = new SslStream(tcp.GetStream(), false);
+                await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = cert,
+                    EnabledSslProtocols = SslProtocols.Tls13 | SslProtocols.Tls12,
+                    ClientCertificateRequired = false
+                });
+                int id = Interlocked.Increment(ref _nextId);
+                c = new ClientHandler(id, ssl);
+                _clients[id] = c;
+                Console.WriteLine($"Server: Client #{id} kết nối ({ssl.SslProtocol}).");
+                await HandleClientAsync(c);
+            }
+            catch (AuthenticationException ex) { Console.WriteLine($"Server: TLS lỗi: {ex.Message}"); }
+            catch (Exception ex) { Console.WriteLine($"Server: Lỗi: {ex.Message}"); }
+            finally
+            {
+                if (c != null)
+                {
+                    _clients.TryRemove(c.Id, out _);
+                    string? room = c.Room;
+                    c.Dispose();
+                    if (room != null) { await BroadcastToRoomAsync(room, $"{c.Account} đã rời phòng.", c.Id); await PushKeysAsync(room); }
+                }
+                tcp.Dispose();
+            }
+        }
+
+        static async Task PushKeysAsync(string room)
+        {
+            var members = _clients.Values.Where(x => x.Room == room && x.PublicKey != null).ToList();
+            string dir = string.Join("|", members.Select(m => $"{m.Account}={m.PublicKey}"));
+            foreach (var m in members)
+                await m.SendAsync($"KEYS|{dir}");
+        }
+        static async Task HandleClientAsync(ClientHandler c)
         {
             try
             {
                 string? line;
-
-                while ((line = await c.Reader.ReadLineAsync()) != null) await ProcessCommandAsync(c, line);
+                while ((line = await c.Reader.ReadLineAsync()) != null)
+                {
+                    try
+                    {
+                        await ProcessCommandAsync(c, line);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Server: Lỗi xử lý #{c.Id}: {ex}");
+                        try { 
+                            await c.SendAsync("ERROR|Server gặp lỗi."); 
+                        }
+                        catch { }
+                    }
+                }
             }
             catch (IOException) { }
             finally
@@ -55,8 +106,7 @@ namespace ChatApplicationServer
                 Console.WriteLine($"Client #{c.Id} đã rời ({_clients.Count} người online).");
             }
         }
-
-        static async Task ProcessCommandAsync(ClientHandle c, string line)
+        static async Task ProcessCommandAsync(ClientHandler c, string line)
         {
             int sep = line.IndexOf('|');
             string command = (sep < 0 ? line : line[..sep]).ToUpperInvariant();
@@ -70,7 +120,7 @@ namespace ChatApplicationServer
 
             if (!c.Authenticated)
             {
-                await c.SendAsync("ERROR| Bạn cần phải đăng nhập trước");
+                await c.SendAsync("ERROR|Bạn cần phải đăng nhập trước");
                 return;
             }
 
@@ -81,7 +131,10 @@ namespace ChatApplicationServer
                     await c.SendAsync($"Tên của bạn: {c.Account}");
                     break;
                 case "JOIN":
-                    await JoinRoomAsync(c, rest.Trim());
+                    var a = rest.Split('|', 2);
+                    string room = a[0].Trim();
+                    if (a.Length > 1) c.PublicKey = a[1];
+                    await JoinRoomAsync(c, room);
                     break;
                 case "LEAVE":
                     await LeaveRoomAsync(c);
@@ -91,7 +144,7 @@ namespace ChatApplicationServer
                     break;
                 case "MESSAGE":
                     if (c.Room is null) await c.SendAsync("Bạn chưa tham gia phòng chat nào. Sử dụng /join <tên phòng>.");
-                    else await BroadcastToRoomAsync(c.Room, $"{c.Room} {c.Account}: {rest}", exceptId: c.Id);
+                    else await BroadcastToRoomAsync(c.Room, $"RELAY|{c.Account}|{rest}", exceptId: c.Id);
                     break;
                 default:
                     await c.SendAsync("Lệnh không hợp lệ");
@@ -99,7 +152,7 @@ namespace ChatApplicationServer
             }
         }
 
-        static async Task HandleAuthAsync(ClientHandle c, string command, string rest)
+        static async Task HandleAuthAsync(ClientHandler c, string command, string rest)
         {
             var a = rest.Split('|', 2);
             string user = a.Length > 0 ? a[0] : "";
@@ -107,16 +160,14 @@ namespace ChatApplicationServer
 
             if (user.Length == 0 || pass.Length == 0)
             {
-                await c.SendAsync("ERROR| Thiếu tên đăng nhập hoặc mật khẩu.");
+                await c.SendAsync("ERROR|Thiếu tên đăng nhập hoặc mật khẩu.");
                 return;
             }
 
             if (command == "REGISTER")
             {
-                if (_db.Register(user, pass, out string err))
-                    await c.SendAsync("OK| Đăng ký thành công! Hãy đăng nhập.");
-                else
-                    await c.SendAsync($"ERROR| {err}");
+                if (_db.Register(user, pass, out string err)) await c.SendAsync("OK|Đăng ký thành công! Hãy đăng nhập.");
+                else await c.SendAsync($"ERROR|{err}");
             }
             else
             {
@@ -124,14 +175,14 @@ namespace ChatApplicationServer
                 {
                     c.Authenticated = true;
                     c.Account = user;
-                    await c.SendAsync($"OK| Xin chào {user}, bạn đã đăng nhập thành công");
-                    Console.WriteLine($"SERVER| {user} đăng nhập (client #{c.Id}).");
+                    await c.SendAsync($"OK|Xin chào {user}, bạn đã đăng nhập thành công");
+                    Console.WriteLine($"SERVER: {user} đăng nhập (client #{c.Id}).");
                 }
-                else await c.SendAsync("ERROR| Sai tên đăng nhập hoặc mật khẩu.");
+                else await c.SendAsync("ERROR|Sai tên đăng nhập hoặc mật khẩu.");
             }
         }
 
-        static async Task JoinRoomAsync(ClientHandle c, string room)
+        static async Task JoinRoomAsync(ClientHandler c, string room)
         {
             if (string.IsNullOrWhiteSpace(room))
             {
@@ -140,7 +191,6 @@ namespace ChatApplicationServer
             }
             if (c.Room != null) await LeaveRoomAsync(c);
             c.Room = room;
-            await c.SendAsync($"Đã vào phòng {room}");
 
             var history = _db.GetRecentMessages(room);
             if (history.Count > 0)
@@ -151,21 +201,23 @@ namespace ChatApplicationServer
             }
 
             await BroadcastToRoomAsync(room, $"{c.Account} đã tham gia phòng chat", exceptId: c.Id);
+            await PushKeysAsync(room);
         }
 
-        static async Task LeaveRoomAsync(ClientHandle c)
+        static async Task LeaveRoomAsync(ClientHandler c)
         {
             if (c.Room is null) return;
             string oldRoom = c.Room;
             c.Room = null;
             await BroadcastToRoomAsync(oldRoom, $"{c.Account} đã rời khỏi phòng chat", exceptId: c.Id);
             await c.SendAsync($"Đã rời khỏi phòng {oldRoom}");
+            await PushKeysAsync(oldRoom);
         }
 
-        static async Task SendRoomListAsync(ClientHandle c)
+        static async Task SendRoomListAsync(ClientHandler c)
         {
             var groups = _clients.Values.Where(x => x.Room != null).GroupBy(x => x.Room)
-                .Select(g => $"{g.Key} ({g.Count()} người)").ToList();
+                                        .Select(g => $"{g.Key} ({g.Count()} người)").ToList();
 
             string body = groups.Count > 0 ? string.Join("\n", groups) : " (chưa có phòng nào)";
             await c.SendAsync($"Danh sách phòng: \n {body}");

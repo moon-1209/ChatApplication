@@ -1,32 +1,34 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 
 namespace ChatApplicationServer.Network
 {
-    internal class ClientHandle : IDisposable
+    internal class ClientHandler : IDisposable
     {
         public string Account { get; set; }
         public string? Room { get; set; }
         public int Id { get; }
+
+        public string? PublicKey { get; set; }
         public bool Authenticated { get; set; }
         public StreamReader Reader { get; }
 
-        private readonly TcpClient _tcp;
+        private readonly SslStream _ssl;
         private readonly StreamWriter _writer;
         private readonly SemaphoreSlim _writerLock = new(1, 1);
 
-        public ClientHandle(int id, TcpClient tcp)
+        public ClientHandler(int id, SslStream ssl)
         {
             Account = $"User{id}";
             Id = id;
-            _tcp = tcp;
-            var stream = tcp.GetStream();
-            Reader = new StreamReader(stream);
-            _writer = new StreamWriter(stream)
+            _ssl = ssl;
+            Reader = new StreamReader(ssl);
+            _writer = new StreamWriter(ssl)
             {
                 AutoFlush = true
             };
@@ -45,6 +47,6 @@ namespace ChatApplicationServer.Network
             }
         }
         
-        public void Dispose() => _tcp.Dispose();
+        public void Dispose() => _ssl.Dispose();
     }
 }

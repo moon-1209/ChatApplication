@@ -2,9 +2,9 @@
 using System.Collections.Generic;
 using Microsoft.Data.SqlClient;
 
-namespace ChatApplicationServer.Network
+namespace ChatApplicationServer.Data
 {
-    internal class Database
+    public class Database
     {
         private readonly string _cs;
         public Database(string cs)
