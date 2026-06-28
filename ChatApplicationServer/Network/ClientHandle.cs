@@ -12,6 +12,7 @@ namespace ChatApplicationServer.Network
         public string Account { get; set; }
         public string? Room { get; set; }
         public int Id { get; }
+        public bool Authenticated { get; set; }
         public StreamReader Reader { get; }
 
         private readonly TcpClient _tcp;
