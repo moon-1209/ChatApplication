@@ -12,34 +12,19 @@ namespace ChatApplicationClient
     {
         static async Task Main(string[] args) //bắt đầu chương trình
         {
-            Console.OutputEncoding = Encoding.UTF8; //đọc tiếng việt
-            Console.Write("Nhập IP Server: ");
-            string host = Console.ReadLine() is { Length: > 0 } h ? h : "127.0.0.1"; //Length: > 0 nghĩa là nếu người dùng nhập vào thì lấy giá trị đó, còn không thì mặc định là
-
-            using var client = new TcpClient(); //Tạo socket
-            await client.ConnectAsync(host, 9000); //kết nối đến sv port 9000 ip 127.0.0.1
-            // Console.WriteLine("Đã kết nối. Gõ tin nhắn rồi Enter để gửi. Nhập /exit để thoát.");
-
-            var stream = client.GetStream(); //Lấy luồng dữ liệu từ socket để đọc và ghi dữ liệu
-            var reader = new StreamReader(stream); //Đọc dữ liệu từ luồng
-            var writer = new StreamWriter(stream) { AutoFlush = true }; //Ghi dữ liệu vào luồng, AutoFlush = true nghĩa là tự động xóa bộ nhớ đệm sau khi ghi dữ liệu
-            if (!await AuthenticateAsync(reader, writer)) return; //Nếu đăng nhập thất bại thì thoát chương trình
-            Console.WriteLine("\nĐăng nhập thành công! Gõ /help để xem lệnh\n");
-            PrintHelp(); //In lệnh hỗ trợ
-            _ = Task.Run(async () => //Tạo một luồng mới để đọc dữ liệu từ server, nếu mất kết nối thì thoát chương trình
-        {
             Console.OutputEncoding = Encoding.UTF8;//đọc tiếng việt
             Console.Write("Nhập IP Server: ");
             string host = Console.ReadLine() is { Length: > 0 } h ? h : "127.0.0.1";//Length: > 0 nghĩa là nếu người dùng nhập vào thì lấy giá trị đó, còn không thì mặc định là
 
             using var client = new TcpClient();//Tạo socket
             await client.ConnectAsync(host, 9000);//kết nối đến sv port 9000 ip 127.0.0.1
-            Console.WriteLine("Đã kết nối. Gõ tin nhắn rồi Enter để gửi. Nhập /exit để thoát.");
 
             var stream = client.GetStream();//Lấy luồng dữ liệu từ socket để đọc và ghi dữ liệu
             var reader = new StreamReader(stream);//Đọc dữ liệu từ luồng
             var writer = new StreamWriter(stream) { AutoFlush = true };//Ghi dữ liệu vào luồng, AutoFlush = true nghĩa là tự động xóa bộ nhớ đệm sau khi ghi dữ liệu
 
+            if (!await AuthenticateAsync(reader, writer)) return;
+            Console.WriteLine("\nĐăng nhập thành công! Gõ /help để xem lệnh\n");
             _ = Task.Run(async () =>
             {
                 try
@@ -71,8 +56,6 @@ namespace ChatApplicationClient
                     }
                 }
                 else await writer.WriteLineAsync($"MESSAGE|{input}"); //Không / thì hiển thị tin nhắn bình thường
-                if (input.Equals("/exit", StringComparison.OrdinalIgnoreCase)) break;
-                await writer.WriteLineAsync(input);
             }
         }
 
@@ -120,40 +103,17 @@ namespace ChatApplicationClient
                     Console.Write("\b \b"); //Xóa dấu * vừa hiển thị trên màn hình
                 }
                 else if (!char.IsControl(key.KeyChar)) //Bỏ qua các phím điều khiển (Tab, Ctrl,...)
-                    NewMethod(sb, key);
+                {
+                    sb.Append(key.KeyChar); //Thêm ký tự vào mật khẩu
+                    Console.Write("*");//Hiển thị dấu * thay cho ký tự thật
+                }    
             }
             Console.WriteLine(); //Xuống dòng sau khi nhấn Enter
             return sb.ToString(); //Trả về mật khẩu đã nhập
-
-            static void NewMethod(StringBuilder sb, ConsoleKeyInfo key)
-            {
-                sb.Append(key.KeyChar); //Thêm ký tự vào mật khẩu
-                Console.Write("*"); //Hiển thị dấu * thay cho ký tự thật
-            }
-        }
-
-        static void PrintHelp() => Console.WriteLine(
-                if (input.StartsWith('/'))//Nếu người dùng nhập vào bắt đầu bằng dấu / thì là câu lệnh
-                {
-                    var parts = input.Split(' ', 2);//tách lệnh
-                    string command = parts[0].ToLowerInvariant();//Chuyển về chữ thường
-                    string arg = parts.Length > 1 ? parts[1] : "";//Lấy tham số từ lệnh
-
-                    switch (command)
-                    {
-                        case "/join": await writer.WriteLineAsync($"JOIN| {arg}"); break;
-                        case "/leave": await writer.WriteLineAsync("LEAVE"); break;
-                        case "/rooms": await writer.WriteLineAsync("ROOMS"); break;
-                        case "/help": PrintHelp(); break;
-                        case "/exit": return;
-                        default: Console.WriteLine("Câu lệnh không tồn tại. Gõ lệnh \"/help\" để xem câu lệnh"); break;//Nếu người dùng nhập vào lệnh không tồn tại thì in ra thông báo
-                    }
-                }
-                else await writer.WriteLineAsync($"MESSAGE|{input}");//Không / thì hiển thị tin nhắn bình thường
-            }
         }
 
         static void PrintHelp() => Console.WriteLine(//Help command ở lệnh trên
+        """
         =================HELP=================
         /join <phòng>: tham gia vào nhóm chat
         /leave: rời khỏi phòng hiện tại
