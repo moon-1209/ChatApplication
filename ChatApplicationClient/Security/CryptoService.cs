@@ -1,9 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Security.Cryptography;
-using System.Text;
-using System.Threading.Tasks;
+﻿using System.Security.Cryptography;
 
 namespace ChatApplicationClient.Security
 {
@@ -25,11 +20,31 @@ namespace ChatApplicationClient.Security
         public static (string cipherB64, string ivB64) AesEncrypt(byte[] data, byte[] key)
         {
             using var aes = Aes.Create();
-            aes.KeySize = 256; aes.Key = key;
+            aes.KeySize = 256;
+            aes.Key = key; 
             aes.GenerateIV();
             using var enc = aes.CreateEncryptor();
             byte[] cipher = enc.TransformFinalBlock(data, 0, data.Length);
             return (Convert.ToBase64String(cipher), Convert.ToBase64String(aes.IV));
+        }
+
+        public static (byte[] cipher, byte[] iv) AesEncryptBytes(byte[] data, byte[] key)
+        {
+            using var aes = Aes.Create();
+            aes.KeySize = 256;
+            aes.Key = key;
+            aes.GenerateIV();
+            using var enc = aes.CreateEncryptor();
+            return (enc.TransformFinalBlock(data, 0, data.Length), aes.IV);
+        }
+
+        public static byte[] AesDecryptBytes(byte[] cipher, byte[] key, byte[] iv)
+        {
+            using var aes = Aes.Create();
+            aes.KeySize = 256; aes.Key = key; 
+            aes.IV = iv;
+            using var dec = aes.CreateDecryptor();
+            return dec.TransformFinalBlock(cipher, 0, cipher.Length);
         }
 
         public static byte[] AesDecrypt(string cipherB64, byte[] key, string ivB64)

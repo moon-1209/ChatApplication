@@ -146,11 +146,40 @@ namespace ChatApplicationServer.Network
                     if (c.Room is null) await c.SendAsync("Bạn chưa tham gia phòng chat nào. Sử dụng /join <tên phòng>.");
                     else await BroadcastToRoomAsync(c.Room, $"RELAY|{c.Account}|{rest}", exceptId: c.Id);
                     break;
+                case "FILE":
+                    {
+                        var p = rest.Split('|');
+                        if (p.Length < 7) break;
+                        var target = FindByAccount(p[0]);
+                        if (target is null) { await c.SendAsync($"* '{p[0]}' không online."); break; }
+                        // Chuyển tiếp, thay ô recipient bằng TÊN NGƯỜI GỬI để bên nhận biết
+                        await target.SendAsync($"FILE|{c.Account}|{p[1]}|{p[2]}|{p[3]}|{p[4]}|{p[5]}|{p[6]}");
+                        break;
+                    }
+                case "FILECHUNK":
+                    {
+                        var p = rest.Split('|', 4);
+                        if (p.Length < 4) break;
+                        var target = FindByAccount(p[0]);
+                        if (target != null) await target.SendAsync($"FILECHUNK|{p[1]}|{p[2]}|{p[3]}");
+                        break;
+                    }
+                case "FILEEND":
+                    {
+                        var p = rest.Split('|', 2);
+                        if (p.Length < 2) break;
+                        var target = FindByAccount(p[0]);
+                        if (target != null) await target.SendAsync($"FILEEND|{p[1]}");
+                        break;
+                    }
                 default:
                     await c.SendAsync("Lệnh không hợp lệ");
                     break;
             }
         }
+
+        static ClientHandler? FindByAccount(string account)
+            => _clients.Values.FirstOrDefault(x => string.Equals(x.Account, account, StringComparison.OrdinalIgnoreCase));
 
         static async Task HandleAuthAsync(ClientHandler c, string command, string rest)
         {
