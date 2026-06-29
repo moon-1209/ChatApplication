@@ -1,4 +1,5 @@
-﻿using ChatApplicationClient.Security;
+﻿using ChatApplicationClient.Core;
+using ChatApplicationClient.Security;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -19,6 +20,10 @@ namespace ChatApplicationClient
         static string _account = "User";
         static readonly Dictionary<string, string> _roomKeys = new();
         static readonly object _keysLock = new();
+
+        static StreamWriter _writer = null!;
+        static readonly SemaphoreSlim _writeLock = new(1, 1);
+        static FileTransferService _ft = null!;
         static async Task Main(string[] args) //bắt đầu chương trình
         {
             Console.OutputEncoding = Encoding.UTF8;//đọc tiếng việt
@@ -59,11 +64,12 @@ namespace ChatApplicationClient
             }
 
             var reader = new StreamReader(ssl);//Đọc dữ liệu từ luồng
-            var writer = new StreamWriter(ssl) { AutoFlush = true };//Ghi dữ liệu vào luồng, AutoFlush = true nghĩa là tự động xóa bộ nhớ đệm sau khi ghi dữ liệu
+            _writer = new StreamWriter(ssl) { AutoFlush = true };//Ghi dữ liệu vào luồng, AutoFlush = true nghĩa là tự động xóa bộ nhớ đệm sau khi ghi dữ liệu
+            _ft = new FileTransferService(SendLineAsync, _crypto);
 
-            if (!await AuthenticateAsync(reader, writer)) return;
+            if (!await AuthenticateAsync(reader, _writer)) return;
             Console.WriteLine("\nĐăng nhập thành công! Gõ /help để xem lệnh\n");
-            await writer.WriteLineAsync($"ACCOUNT|{_account}");
+            await _writer.WriteLineAsync($"ACCOUNT|{_account}");
             PrintHelp();
 
             _ = Task.Run(async () =>
@@ -91,31 +97,62 @@ namespace ChatApplicationClient
                     {
                         case "/join": //Gửi lệnh tham gia phòng kèm tên phòng lên server
                             lock (_keysLock) _roomKeys.Clear();
-                            await writer.WriteLineAsync($"JOIN|{arg}|{_crypto.ExportPublicKey()}");
+                            await _writer.WriteLineAsync($"JOIN|{arg}|{_crypto.ExportPublicKey()}");
                             break;
-                        case "/leave": await writer.WriteLineAsync("LEAVE"); break; //Gửi lệnh rời phòng lên server
-                        case "/rooms": await writer.WriteLineAsync("ROOMS"); break; //Gửi lệnh lấy danh sách phòng từ server
+                        case "/leave": await _writer.WriteLineAsync("LEAVE"); break; //Gửi lệnh rời phòng lên server
+                        case "/rooms": await _writer.WriteLineAsync("ROOMS"); break; //Gửi lệnh lấy danh sách phòng từ server
+                        case "/sendfile": StartFileSend(arg); break;
                         case "/help": PrintHelp(); break; //Hiển thị danh sách lệnh hỗ trợ
                         case "/exit": return; //Thoát chương trình
                         default: Console.WriteLine("Câu lệnh không tồn tại. Gõ lệnh \"/help\" để xem câu lệnh"); break; //Nếu người dùng nhập vào lệnh không tồn tại thì in ra thông báo
                     }
                 }
-                else await SendEncryptedAsync(writer, input); //Không / thì hiển thị tin nhắn bình thường
+                else await SendEncryptedAsync(input); //Không / thì hiển thị tin nhắn bình thường
             }
         }
 
-        static async Task SendEncryptedAsync(StreamWriter writer, string text)
+        static async Task SendLineAsync(string s)
+        {
+            await _writeLock.WaitAsync();
+            try
+            { 
+                await _writer.WriteLineAsync(s);
+            }
+            catch { }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+
+        static void StartFileSend(string arg)
+        {
+            var fa = arg.Split(' ', 2);
+            if (fa.Length < 2)
+            {
+                Console.WriteLine("Sử dụng: /sendfile <tên người nhận> <đường dẫn file>");
+                return; 
+            }
+            string rcpt = fa[0].Trim();
+            string path = fa[1].Trim().Trim('"');
+
+            string? pub;
+            lock (_keysLock) _roomKeys.TryGetValue(rcpt, out pub);
+            if (pub is null) { Console.WriteLine($"Chưa có khóa của '{rcpt}' (người nhận phải ở cùng phòng)."); return; }
+
+            _ = _ft.SendFileAsync(rcpt, pub, path);
+        }
+
+        static async Task SendEncryptedAsync(string text)
         {
             Dictionary<string, string> recipients;
             lock (_keysLock) recipients = _roomKeys.Where(kv => kv.Key != _account).ToDictionary(kv => kv.Key, kv => kv.Value);
 
             byte[] aesKey = CryptoService.NewAesKey();
             var (cipher, iv) = CryptoService.AesEncrypt(Encoding.UTF8.GetBytes(text), aesKey);
-
             var slots = recipients.Select(r => $"{r.Key}:{CryptoService.WrapKey(aesKey, r.Value)}");
-            string envelope = string.Join(",", slots);
 
-            await writer.WriteLineAsync($"MESSAGE|{iv}|{cipher}|{envelope}");
+            await SendLineAsync($"MESSAGE|{iv}|{cipher}|{string.Join(",", slots)}");
         }
 
         static void HandleIncoming(string line)
@@ -159,6 +196,11 @@ namespace ChatApplicationClient
                         catch { Console.WriteLine($"{sender}: không giải mã được"); }
                         break;
                     }
+                    case "FILE":
+                    case "FILECHUNK":
+                    case "FILEEND":
+                        _ft.HandleFilePacket(type, rest);
+                        break;
                 default:
                     Console.WriteLine(line);
                     break;
@@ -190,7 +232,7 @@ namespace ChatApplicationClient
                 var p = resp.Split('|', 2); //Tách phản hồi thành status và message
                 string status = p[0]; //Lấy trạng thái: OK hoặc ERROR
                 string msg = p.Length > 1 ? p[1] : ""; //Lấy nội dung thông báo từ server
-                Console.WriteLine(status == "OK" ? $"{msg}" : $"{msg}"); //In thông báo ra màn hình
+                Console.WriteLine(msg); //In thông báo ra màn hình
 
                 if (status == "OK" && command == "LOGIN") return true; //Đăng nhập thành công thì trả về true
             }
@@ -223,6 +265,8 @@ namespace ChatApplicationClient
         /join <phòng>: tham gia vào nhóm chat
         /leave: rời khỏi phòng hiện tại
         /rooms: xem danh sách các phòng
+        /sendfile <người nhận> <file>: gửi file cho người cùng phòng
+        /exit: thoát ứng dụng
         /help: xem các câu lệnh
         ======================================
         """); //In danh sách lệnh hỗ trợ ra màn hình
