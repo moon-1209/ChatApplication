@@ -1,57 +1,67 @@
 ﻿using ChatApplicationClient.Core;
 using ChatApplicationClient.Security;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Threading.Tasks;
 
-namespace ChatApplicationClient
-{
-    internal class ChatClient
+    internal enum AuthResult
     {
-        static readonly CryptoService _crypto = new();
-        static string _account = "User";
-        static readonly Dictionary<string, string> _roomKeys = new();
-        static readonly object _keysLock = new();
+        LoginSuccess,
+        RegisterSuccess,
+        Failed
+    }
+    internal sealed class ChatClient : IDisposable
+    {
+        private readonly CryptoService _crypto = new();
+        private readonly Dictionary<string, string> _roomKeys = new();
+        private readonly object _keysLock = new();
 
-        static StreamWriter _writer = null!;
-        static readonly SemaphoreSlim _writeLock = new(1, 1);
-        static FileTransferService _ft = null!;
-        static async Task Main(string[] args) //bắt đầu chương trình
+        private TcpClient? _client;
+        private SslStream? _ssl;
+        private StreamReader? _reader;
+        private StreamWriter? _writer;
+        private readonly SemaphoreSlim _writeLock = new(1, 1);
+        private FileTransferService? _ft;
+
+        private string _account = "User";
+
+        public string Account => _account;
+
+        public string? CurrentRoom { get; private set; }
+
+        public event Action<string, string, bool>? OnMessageReceived;
+
+        public event Action<string>? OnSystemMessage;
+
+        public event Action<IReadOnlyList<string>>? OnKeysUpdated;
+
+        public event Action<string, string>? OnFileReceived;
+
+        public event Action<string, int>? OnFileProgress;
+
+        public event Action? OnDisconnected;
+
+        public async Task ConnectAsync(string host, string displayName)
         {
-            Console.OutputEncoding = Encoding.UTF8;//đọc tiếng việt
-            Console.Write("Nhập IP Server: ");
-            string host = Console.ReadLine() is { Length: > 0 } h ? h : "127.0.0.1";//Length: > 0 nghĩa là nếu người dùng nhập vào thì lấy giá trị đó, còn không thì mặc định là
-
-            Console.Write("Nhập tên hiển thị: ");
-            _account = Console.ReadLine() is { Length: > 0 } n ? n : "User";
+            _account = string.IsNullOrWhiteSpace(displayName) ? "User" : displayName.Trim();
 
             string certPath = Path.Combine(AppContext.BaseDirectory, "server.cer");
-
-            if (!File.Exists(certPath))
-            {
-                Console.WriteLine("Thiếu 'server.cer'");
-                return;
-            }
+            if (!File.Exists(certPath)) throw new FileNotFoundException("Thiếu 'server.cer' cạnh file thực thi.");
 
             var pinned = X509CertificateLoader.LoadCertificateFromFile(certPath);
 
-            using var client = new TcpClient();//Tạo socket
-            await client.ConnectAsync(host, 9000);//kết nối đến sv port 9000 ip 127.0.0.1
+            _client = new TcpClient();
+            await _client.ConnectAsync(host, 9000);
 
-            var ssl = new SslStream(client.GetStream(), false, (sender, cert, chain, errors) =>
-                cert != null && CryptographicOperations.FixedTimeEquals(SHA256.HashData(cert.GetRawCertData()), SHA256.HashData(pinned.GetRawCertData())));
+            _ssl = new SslStream(_client.GetStream(), false, (sender, cert, chain, errors) =>
+                cert != null && CryptographicOperations.FixedTimeEquals(SHA256.HashData(cert.GetRawCertData()),SHA256.HashData(pinned.GetRawCertData())));
 
             try
             {
-                await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                await _ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
                 {
                     TargetHost = "ChatServer",
                     EnabledSslProtocols = SslProtocols.Tls13 | SslProtocols.Tls12
@@ -59,103 +69,117 @@ namespace ChatApplicationClient
             }
             catch (AuthenticationException)
             {
-                Console.WriteLine("Chứng chỉ không khớp có thể bị giả mạo, từ chối kết nối");
-                return;
+                _ssl.Dispose();
+                throw new AuthenticationException("Chứng chỉ không khớp, có thể bị giả mạo, từ chối kết nối.");
             }
 
-            var reader = new StreamReader(ssl);//Đọc dữ liệu từ luồng
-            _writer = new StreamWriter(ssl) { AutoFlush = true };//Ghi dữ liệu vào luồng, AutoFlush = true nghĩa là tự động xóa bộ nhớ đệm sau khi ghi dữ liệu
+            _reader = new StreamReader(_ssl);
+            _writer = new StreamWriter(_ssl) { AutoFlush = true };
+
             _ft = new FileTransferService(SendLineAsync, _crypto);
+            _ft.OnLog += msg => OnSystemMessage?.Invoke(msg);
+            _ft.OnProgress += (info, pct) => OnFileProgress?.Invoke(info, pct);
+            _ft.OnFileSaved += (name, path) => OnFileReceived?.Invoke(name, path);
+        }
 
-            if (!await AuthenticateAsync(reader, _writer)) return;
-            Console.WriteLine("\nĐăng nhập thành công! Gõ /help để xem lệnh\n");
+        public async Task<(AuthResult result, string message)> AuthenticateAsync(bool register, string user, string pass)
+        {
+            if (_writer is null || _reader is null) throw new InvalidOperationException("Chưa kết nối.");
+
+            string command = register ? "REGISTER" : "LOGIN";
+            await _writer.WriteLineAsync($"{command}|{user}|{pass}");
+
+            string? resp = await _reader.ReadLineAsync();
+            if (resp is null) throw new IOException("Mất kết nối khi xác thực.");
+
+            var p = resp.Split('|', 2);
+            string status = p[0];
+            string msg = p.Length > 1 ? p[1] : "";
+
+            AuthResult result;
+            if (status == "OK")
+                result = register ? AuthResult.RegisterSuccess : AuthResult.LoginSuccess;
+            else
+                result = AuthResult.Failed;
+
+            return (result, msg);
+        }
+
+        public Task<(AuthResult result, string message)> LoginAsync(string user, string pass) => AuthenticateAsync(false, user, pass);
+
+        public Task<(AuthResult result, string message)> RegisterAsync(string user, string pass) => AuthenticateAsync(true, user, pass);
+        public async Task StartSessionAsync()
+        {
+            if (_writer is null || _reader is null) throw new InvalidOperationException("Chưa kết nối.");
             await _writer.WriteLineAsync($"ACCOUNT|{_account}");
-            PrintHelp();
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    string? line;
-                    while ((line = await reader.ReadLineAsync()) != null) HandleIncoming(line); //Liên tục đọc từng dòng từ server và in ra màn hình
-                }
-                catch { } //Bỏ qua lỗi khi kết nối bị đóng đột ngột
-                Console.WriteLine("Mất kết nối tới Server");
-                Environment.Exit(0); //Thoát chương trình
-            });
-
-            string? input;
-            while ((input = Console.ReadLine()) != null) //Đọc dữ liệu từ bàn phím và vòng lặp tn
-            {
-                if (input.StartsWith('/')) //Nếu người dùng nhập vào bắt đầu bằng dấu / thì là câu lệnh
-                {
-                    var parts = input.Split(' ', 2); //tách lệnh
-                    string command = parts[0].ToLowerInvariant(); //Chuyển về chữ thường
-                    string arg = parts.Length > 1 ? parts[1] : ""; //Lấy tham số từ lệnh
-
-                    switch (command)
-                    {
-                        case "/join": //Gửi lệnh tham gia phòng kèm tên phòng lên server
-                            lock (_keysLock) _roomKeys.Clear();
-                            await _writer.WriteLineAsync($"JOIN|{arg}|{_crypto.ExportPublicKey()}");
-                            break;
-                        case "/leave": await _writer.WriteLineAsync("LEAVE"); break; //Gửi lệnh rời phòng lên server
-                        case "/rooms": await _writer.WriteLineAsync("ROOMS"); break; //Gửi lệnh lấy danh sách phòng từ server
-                        case "/sendfile": StartFileSend(arg); break;
-                        case "/help": PrintHelp(); break; //Hiển thị danh sách lệnh hỗ trợ
-                        case "/exit": return; //Thoát chương trình
-                        default: Console.WriteLine("Câu lệnh không tồn tại. Gõ lệnh \"/help\" để xem câu lệnh"); break; //Nếu người dùng nhập vào lệnh không tồn tại thì in ra thông báo
-                    }
-                }
-                else await SendEncryptedAsync(input); //Không / thì hiển thị tin nhắn bình thường
-            }
+            _ = Task.Run(ReceiveLoopAsync);
         }
 
-        static async Task SendLineAsync(string s)
+        public async Task JoinRoomAsync(string room)
         {
-            await _writeLock.WaitAsync();
-            try
-            { 
-                await _writer.WriteLineAsync(s);
-            }
-            catch { }
-            finally
-            {
-                _writeLock.Release();
-            }
+            lock (_keysLock) _roomKeys.Clear();
+            CurrentRoom = room;
+            await SendLineAsync($"JOIN|{room}|{_crypto.ExportPublicKey()}");
         }
 
-        static void StartFileSend(string arg)
+        public async Task LeaveRoomAsync()
         {
-            var fa = arg.Split(' ', 2);
-            if (fa.Length < 2)
-            {
-                Console.WriteLine("Sử dụng: /sendfile <tên người nhận> <đường dẫn file>");
-                return; 
-            }
-            string rcpt = fa[0].Trim();
-            string path = fa[1].Trim().Trim('"');
-
-            string? pub;
-            lock (_keysLock) _roomKeys.TryGetValue(rcpt, out pub);
-            if (pub is null) { Console.WriteLine($"Chưa có khóa của '{rcpt}' (người nhận phải ở cùng phòng)."); return; }
-
-            _ = _ft.SendFileAsync(rcpt, pub, path);
+            CurrentRoom = null;
+            lock (_keysLock) _roomKeys.Clear();
+            await SendLineAsync("LEAVE");
         }
 
-        static async Task SendEncryptedAsync(string text)
+        public Task RequestRoomsAsync() => SendLineAsync("ROOMS");
+
+        public async Task SendMessageAsync(string text)
         {
             Dictionary<string, string> recipients;
-            lock (_keysLock) recipients = _roomKeys.Where(kv => kv.Key != _account).ToDictionary(kv => kv.Key, kv => kv.Value);
+            lock (_keysLock)
+                recipients = _roomKeys.Where(kv => kv.Key != _account)
+                                      .ToDictionary(kv => kv.Key, kv => kv.Value);
 
             byte[] aesKey = CryptoService.NewAesKey();
             var (cipher, iv) = CryptoService.AesEncrypt(Encoding.UTF8.GetBytes(text), aesKey);
             var slots = recipients.Select(r => $"{r.Key}:{CryptoService.WrapKey(aesKey, r.Value)}");
 
             await SendLineAsync($"MESSAGE|{iv}|{cipher}|{string.Join(",", slots)}");
+
+            OnMessageReceived?.Invoke(_account, text, true);
         }
 
-        static void HandleIncoming(string line)
+        public async Task SendFileAsync(string path)
+        {
+            if (_ft is null) return;
+
+            Dictionary<string, string> recipients;
+            lock (_keysLock)
+                recipients = _roomKeys.Where(kv => kv.Key != _account)
+                                      .ToDictionary(kv => kv.Key, kv => kv.Value);
+
+            if (recipients.Count == 0)
+            {
+                OnSystemMessage?.Invoke("Không có ai khác trong phòng để gửi file.");
+                return;
+            }
+
+            foreach (var r in recipients)
+                await _ft.SendFileAsync(r.Key, r.Value, path);
+        }
+
+        private async Task ReceiveLoopAsync()
+        {
+        try
+        {
+            string? line;
+            while (_reader != null && (line = await _reader.ReadLineAsync()) != null)
+                HandleIncoming(line);
+        }
+        catch { }
+
+            OnDisconnected?.Invoke();
+        }
+
+        private void HandleIncoming(string line)
         {
             int sep = line.IndexOf('|');
             string type = sep < 0 ? line : line[..sep];
@@ -164,16 +188,21 @@ namespace ChatApplicationClient
             switch (type)
             {
                 case "KEYS":
-                    lock (_keysLock)
                     {
-                        _roomKeys.Clear();
-                        foreach (var entry in rest.Split('|', StringSplitOptions.RemoveEmptyEntries))
+                        List<string> members;
+                        lock (_keysLock)
                         {
-                            int eq = entry.IndexOf('=');
-                            if (eq > 0) _roomKeys[entry[..eq]] = entry[(eq + 1)..];
+                            _roomKeys.Clear();
+                            foreach (var entry in rest.Split('|', StringSplitOptions.RemoveEmptyEntries))
+                            {
+                                int eq = entry.IndexOf('=');
+                                if (eq > 0) _roomKeys[entry[..eq]] = entry[(eq + 1)..];
+                            }
+                            members = _roomKeys.Keys.ToList();
                         }
+                        OnKeysUpdated?.Invoke(members);
+                        break;
                     }
-                    break;
                 case "RELAY":
                     {
                         var p = rest.Split('|');
@@ -191,84 +220,39 @@ namespace ChatApplicationClient
                         {
                             byte[] aesKey = _crypto.UnwrapKey(myWrapped);
                             string text = Encoding.UTF8.GetString(CryptoService.AesDecrypt(cipher, aesKey, iv));
-                            Console.WriteLine($"{sender}: {text}");
+                            OnMessageReceived?.Invoke(sender, text, false);
                         }
-                        catch { Console.WriteLine($"{sender}: không giải mã được"); }
+                        catch { OnMessageReceived?.Invoke(sender, "không giải mã được", false); }
                         break;
                     }
-                    case "FILE":
-                    case "FILECHUNK":
-                    case "FILEEND":
-                        _ft.HandleFilePacket(type, rest);
-                        break;
+                case "FILE":
+                case "FILECHUNK":
+                case "FILEEND":
+                    _ft?.HandleFilePacket(type, rest);
+                    break;
+                case "OK":
+                case "ERROR":
+                    OnSystemMessage?.Invoke(rest.Length > 0 ? rest : line);
+                    break;
                 default:
-                    Console.WriteLine(line);
+                    OnSystemMessage?.Invoke(line);
                     break;
             }
         }
-        static async Task<bool> AuthenticateAsync(StreamReader reader, StreamWriter writer)
+
+        private async Task SendLineAsync(string s)
         {
-            while (true) //Lặp cho đến khi đăng nhập thành công hoặc người dùng thoát
-            {
-                Console.Write("\n1: Đăng nhập.\n2: Đăng ký.\nq: Thoát.\nLựa chọn: ");
-                string choice = (Console.ReadLine() ?? "").Trim().ToLowerInvariant(); //Đọc lựa chọn, xóa khoảng trắng và chuyển về chữ thường
-                if (choice == "q") return false; //Người dùng chọn thoát
-
-                Console.Write("Tên đăng nhập: ");
-                string user = Console.ReadLine() ?? ""; //Đọc tên đăng nhập, nếu null thì dùng chuỗi rỗng
-                Console.Write("Mật khẩu: ");
-                string pass = ReadPassword(); //Đọc mật khẩu ẩn ký tự
-
-                string command = choice == "2" ? "REGISTER" : "LOGIN"; //Xác định lệnh gửi lên server: đăng ký hoặc đăng nhập
-                await writer.WriteLineAsync($"{command}|{user}|{pass}"); //Gửi lệnh kèm thông tin lên server
-
-                string? resp = await reader.ReadLineAsync(); //Chờ phản hồi từ server
-                if (resp is null)
-                {
-                    Console.WriteLine("Mất kết nối."); //Server ngắt kết nối bất ngờ
-                    return false;
-                }
-
-                var p = resp.Split('|', 2); //Tách phản hồi thành status và message
-                string status = p[0]; //Lấy trạng thái: OK hoặc ERROR
-                string msg = p.Length > 1 ? p[1] : ""; //Lấy nội dung thông báo từ server
-                Console.WriteLine(msg); //In thông báo ra màn hình
-
-                if (status == "OK" && command == "LOGIN") return true; //Đăng nhập thành công thì trả về true
-            }
+            if (_writer is null) return;
+            await _writeLock.WaitAsync();
+            try { await _writer.WriteLineAsync(s); }
+            catch { }
+            finally { _writeLock.Release(); }
         }
 
-        static string ReadPassword()
+        public void Dispose()
         {
-            var sb = new StringBuilder(); //Dùng StringBuilder để ghép từng ký tự mật khẩu
-            ConsoleKeyInfo key;
-            while ((key = Console.ReadKey(intercept: true)).Key != ConsoleKey.Enter) //Đọc từng phím, intercept: true để không hiển thị ký tự ra màn hình
-            {
-                if (key.Key == ConsoleKey.Backspace && sb.Length > 0) //Nếu nhấn Backspace và còn ký tự
-                {
-                    sb.Length--; //Xóa ký tự cuối trong bộ nhớ
-                    Console.Write("\b \b"); //Xóa dấu * vừa hiển thị trên màn hình
-                }
-                else if (!char.IsControl(key.KeyChar)) //Bỏ qua các phím điều khiển (Tab, Ctrl,...)
-                {
-                    sb.Append(key.KeyChar); //Thêm ký tự vào mật khẩu
-                    Console.Write("*");//Hiển thị dấu * thay cho ký tự thật
-                }    
-            }
-            Console.WriteLine(); //Xuống dòng sau khi nhấn Enter
-            return sb.ToString(); //Trả về mật khẩu đã nhập
+            try { _ssl?.Dispose(); } catch { }
+            try { _client?.Dispose(); } catch { }
+            _crypto.Dispose();
         }
-
-        static void PrintHelp() => Console.WriteLine(//Help command ở lệnh trên
-        """
-        =================HELP=================
-        /join <phòng>: tham gia vào nhóm chat
-        /leave: rời khỏi phòng hiện tại
-        /rooms: xem danh sách các phòng
-        /sendfile <người nhận> <file>: gửi file cho người cùng phòng
-        /exit: thoát ứng dụng
-        /help: xem các câu lệnh
-        ======================================
-        """); //In danh sách lệnh hỗ trợ ra màn hình
     }
-}
