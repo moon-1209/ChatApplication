@@ -10,6 +10,11 @@ namespace ChatApplicationClient.Core
         private readonly CryptoService _crypto;
         private readonly ConcurrentDictionary<string, Incoming> _incoming = new();
 
+        // Các event thay cho Console.WriteLine cũ để UI hiển thị (không đổi protocol/crypto)
+        public event Action<string>? OnLog;                 // thông báo trạng thái dạng chữ
+        public event Action<string, int>? OnProgress;       // (mô tả, phần trăm 0..100; <0 = hoàn tất/ẩn)
+        public event Action<string, string>? OnFileSaved;   // (tên file, đường dẫn đầy đủ)
+
         public FileTransferService(Func<string, Task> send, CryptoService crypto)
         {
             _send = send;
@@ -25,9 +30,9 @@ namespace ChatApplicationClient.Core
 
         public async Task SendFileAsync(string recipient, string recipientPublicKeyB64, string path)
         {
-            if(!File.Exists(path))
+            if (!File.Exists(path))
             {
-                Console.WriteLine($"Không tìm thấy File: {path}");
+                OnLog?.Invoke($"Không tìm thấy File: {path}");
                 return;
             }
             string fileName = Path.GetFileName(path);
@@ -39,7 +44,7 @@ namespace ChatApplicationClient.Core
 
             string transferId = Guid.NewGuid().ToString();
             int total = (int)Math.Ceiling(cipher.Length / (double)ChunkSize);
-            Console.WriteLine($"Gửi '{fileName} ({data.Length:NO} byte, {total} mảnh) đến {recipient}");
+            OnLog?.Invoke($"Gửi '{fileName}' ({data.Length:N0} byte, {total} mảnh) đến {recipient}");
 
             await _send($"FILE|{recipient}|{transferId}|{fileName}|{data.Length}|{total}|{wrappedKey}|{ivB64}");
 
@@ -50,11 +55,13 @@ namespace ChatApplicationClient.Core
                 string chunkB64 = Convert.ToBase64String(cipher, offset, len);
                 await _send($"FILECHUNK|{recipient}|{transferId}|{i}|{chunkB64}");
 
-                if (total >= 5 && (i + 1) % (total / 5) == 0) Console.WriteLine($"{(i + 1) * 100 / total}%");
+                // Báo tiến độ gửi theo phần trăm cho thanh progress trên UI
+                OnProgress?.Invoke($"Đang gửi '{fileName}' → {recipient}", (i + 1) * 100 / total);
             }
 
             await _send($"FILEEND|{recipient}|{transferId}");
-            Console.WriteLine($"Đã gửi thành công '{fileName}'");
+            OnProgress?.Invoke($"Đã gửi '{fileName}'", -1);
+            OnLog?.Invoke($"Đã gửi thành công '{fileName}' đến {recipient}");
         }
 
         public void HandleFilePacket(string type, string rest)
@@ -73,7 +80,7 @@ namespace ChatApplicationClient.Core
                             WrappedKeyB64 = p[5],
                             IvB64 = p[6]
                         };
-                        Console.WriteLine($"⬇ Đang nhận '{p[2]}' từ {p[0]} ({p[4]} mảnh)...");
+                        OnLog?.Invoke($"⬇ Đang nhận '{p[2]}' từ {p[0]} ({p[4]} mảnh)...");
                         break;
                     }
                 case "FILECHUNK":
@@ -101,7 +108,7 @@ namespace ChatApplicationClient.Core
                 {
                     if (!inc.Chunks.TryGetValue(i, out var chunk))
                     {
-                        Console.WriteLine($"File '{inc.FileName}' thiếu mảnh {i}.");
+                        OnLog?.Invoke($"File '{inc.FileName}' thiếu mảnh {i}.");
                         return;
                     }
                     ms.Write(chunk, 0, chunk.Length);
@@ -114,11 +121,13 @@ namespace ChatApplicationClient.Core
                 string path = Path.Combine("received", inc.FileName);
                 await File.WriteAllBytesAsync(path, plain);
 
-                Console.WriteLine($"Đã nhận và giải mã '{inc.FileName}' thành công");
+                string full = Path.GetFullPath(path);
+                OnLog?.Invoke($"Đã nhận và giải mã '{inc.FileName}' từ {inc.Sender} thành công");
+                OnFileSaved?.Invoke(inc.FileName, full);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Lỗi nhận file: {ex.Message}");
+                OnLog?.Invoke($"Lỗi nhận file: {ex.Message}");
             }
         }
     }
